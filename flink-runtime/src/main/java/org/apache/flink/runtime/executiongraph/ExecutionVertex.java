@@ -36,7 +36,6 @@ import org.apache.flink.runtime.jobgraph.JobEdge;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobmanager.scheduler.CoLocationConstraint;
 import org.apache.flink.runtime.jobmanager.scheduler.CoLocationGroup;
-import org.apache.flink.runtime.jobmanager.scheduler.LocationPreferenceConstraint;
 import org.apache.flink.runtime.jobmaster.LogicalSlot;
 import org.apache.flink.runtime.scheduler.strategy.ExecutionVertexID;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
@@ -45,7 +44,6 @@ import org.apache.flink.util.ExceptionUtils;
 
 import org.slf4j.Logger;
 
-import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
@@ -61,6 +59,8 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import static org.apache.flink.runtime.execution.ExecutionState.FINISHED;
+import static org.apache.flink.util.Preconditions.checkArgument;
+import static org.apache.flink.util.Preconditions.checkState;
 
 /**
  * The ExecutionVertex is a parallel subtask of the execution. It may be executed once, or several times, each of
@@ -655,26 +655,6 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 		}
 	}
 
-	/**
-	 * Schedules the current execution of this ExecutionVertex.
-	 *
-	 * @param slotProviderStrategy to allocate the slots from
-	 * @param locationPreferenceConstraint constraint for the location preferences
-	 * @param allPreviousExecutionGraphAllocationIds set with all previous allocation ids in the job graph.
-	 *                                                 Can be empty if the allocation ids are not required for scheduling.
-	 * @return Future which is completed once the execution is deployed. The future
-	 * can also completed exceptionally.
-	 */
-	public CompletableFuture<Void> scheduleForExecution(
-			SlotProviderStrategy slotProviderStrategy,
-			LocationPreferenceConstraint locationPreferenceConstraint,
-			@Nonnull Set<AllocationID> allPreviousExecutionGraphAllocationIds) {
-		return this.currentExecution.scheduleForExecution(
-			slotProviderStrategy,
-			locationPreferenceConstraint,
-			allPreviousExecutionGraphAllocationIds);
-	}
-
 	public void tryAssignResource(LogicalSlot slot) {
 		if (!currentExecution.tryAssignResource(slot)) {
 			throw new IllegalStateException("Could not assign resource " + slot + " to current execution " +
@@ -727,34 +707,15 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 		currentExecution.markFailed(t);
 	}
 
-	/**
-	 * Schedules or updates the consumer tasks of the result partition with the given ID.
-	 */
-	void scheduleOrUpdateConsumers(ResultPartitionID partitionId) {
-
-		final Execution execution = currentExecution;
-
-		// Abort this request if there was a concurrent reset
-		if (!partitionId.getProducerId().equals(execution.getAttemptId())) {
-			return;
-		}
+	void notifyPartitionDataAvailable(ResultPartitionID partitionId) {
+		checkArgument(partitionId.getProducerId().equals(currentExecution.getAttemptId()));
 
 		final IntermediateResultPartition partition = resultPartitions.get(partitionId.getPartitionId());
-
-		if (partition == null) {
-			throw new IllegalStateException("Unknown partition " + partitionId + ".");
-		}
+		checkState(partition != null, "Unknown partition " + partitionId + ".");
+		checkState(partition.getResultType().isPipelined(), "partition data available notification is " +
+			"only valid for pipelined partitions.");
 
 		partition.markDataProduced();
-
-		if (partition.getIntermediateResult().getResultType().isPipelined()) {
-			// Schedule or update receivers of this partition
-			execution.scheduleOrUpdateConsumers(partition.getConsumers());
-		}
-		else {
-			throw new IllegalArgumentException("ScheduleOrUpdateConsumers msg is only valid for" +
-					"pipelined partitions.");
-		}
 	}
 
 	void cachePartitionInfo(PartitionInfo partitionInfo){
@@ -876,11 +837,11 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 	/**
 	 * Simply forward this notification.
 	 */
-	void notifyStateTransition(Execution execution, ExecutionState newState, Throwable error) {
+	void notifyStateTransition(Execution execution, ExecutionState newState) {
 		// only forward this notification if the execution is still the current execution
 		// otherwise we have an outdated execution
 		if (isCurrentExecution(execution)) {
-			getExecutionGraph().notifyExecutionChange(execution, newState, error);
+			getExecutionGraph().notifyExecutionChange(execution, newState);
 		}
 	}
 
@@ -900,9 +861,5 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 	@Override
 	public ArchivedExecutionVertex archive() {
 		return new ArchivedExecutionVertex(this);
-	}
-
-	public boolean isLegacyScheduling() {
-		return getExecutionGraph().isLegacyScheduling();
 	}
 }

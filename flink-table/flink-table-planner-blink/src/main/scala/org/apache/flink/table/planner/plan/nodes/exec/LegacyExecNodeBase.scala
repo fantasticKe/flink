@@ -20,6 +20,10 @@ package org.apache.flink.table.planner.plan.nodes.exec
 
 import org.apache.flink.api.dag.Transformation
 import org.apache.flink.table.delegation.Planner
+import org.apache.flink.table.planner.calcite.FlinkTypeFactory
+import org.apache.flink.table.planner.plan.nodes.exec.visitor.ExecNodeVisitor
+import org.apache.flink.table.planner.plan.nodes.physical.FlinkPhysicalRel
+import org.apache.flink.table.types.logical.LogicalType
 import org.apache.flink.util.Preconditions.{checkArgument, checkNotNull}
 
 import org.apache.calcite.rel.RelDistribution
@@ -50,6 +54,14 @@ trait LegacyExecNodeBase[P <: Planner, T] extends ExecNode[T] {
    */
   private var inputNodes: util.List[ExecNode[_]] = _
 
+  override def getDesc: String = {
+    this.asInstanceOf[FlinkPhysicalRel].getRelDetailedDescription
+  }
+
+  override def getOutputType: LogicalType = {
+    FlinkTypeFactory.toLogicalRowType(this.asInstanceOf[FlinkPhysicalRel].getRowType)
+  }
+
   override def getInputNodes: util.List[ExecNode[_]] = {
     checkNotNull(inputNodes)
   }
@@ -62,6 +74,10 @@ trait LegacyExecNodeBase[P <: Planner, T] extends ExecNode[T] {
   // TODO this is a temporary solution to set input nodes
   def setInputNodes(inputNodes: util.List[ExecNode[_]]): Unit = {
     this.inputNodes = new util.ArrayList[ExecNode[_]](inputNodes)
+  }
+
+  override def replaceInputEdge(ordinalInParent: Int, newInputEdge: ExecEdge): Unit = {
+    throw new UnsupportedOperationException("This method is unsupported on LegacyExecNodeBase")
   }
 
   /**

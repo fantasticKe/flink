@@ -22,7 +22,6 @@ package org.apache.flink.runtime.scheduler;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
-import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
@@ -48,20 +47,13 @@ import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.executiongraph.ExecutionDeploymentListener;
 import org.apache.flink.runtime.executiongraph.ExecutionGraph;
 import org.apache.flink.runtime.executiongraph.ExecutionGraphBuilder;
-import org.apache.flink.runtime.executiongraph.ExecutionGraphException;
 import org.apache.flink.runtime.executiongraph.ExecutionJobVertex;
 import org.apache.flink.runtime.executiongraph.ExecutionStateUpdateListener;
 import org.apache.flink.runtime.executiongraph.ExecutionVertex;
 import org.apache.flink.runtime.executiongraph.IntermediateResult;
 import org.apache.flink.runtime.executiongraph.JobStatusListener;
 import org.apache.flink.runtime.executiongraph.TaskExecutionStateTransition;
-import org.apache.flink.runtime.executiongraph.failover.FailoverStrategy;
-import org.apache.flink.runtime.executiongraph.failover.FailoverStrategyLoader;
-import org.apache.flink.runtime.executiongraph.failover.NoOpFailoverStrategy;
 import org.apache.flink.runtime.executiongraph.failover.flip1.ResultPartitionAvailabilityChecker;
-import org.apache.flink.runtime.executiongraph.restart.RestartStrategy;
-import org.apache.flink.runtime.executiongraph.restart.RestartStrategyFactory;
-import org.apache.flink.runtime.executiongraph.restart.RestartStrategyResolving;
 import org.apache.flink.runtime.io.network.partition.JobMasterPartitionTracker;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
@@ -165,15 +157,11 @@ public abstract class SchedulerBase implements SchedulerNG {
 
 	private final Time rpcTimeout;
 
-	private final RestartStrategy restartStrategy;
-
 	private final BlobWriter blobWriter;
 
 	private final JobManagerJobMetricGroup jobManagerJobMetricGroup;
 
 	private final Time slotRequestTimeout;
-
-	private final boolean legacyScheduling;
 
 	protected final ExecutionVertexVersioner executionVertexVersioner;
 
@@ -194,7 +182,6 @@ public abstract class SchedulerBase implements SchedulerNG {
 		final ClassLoader userCodeLoader,
 		final CheckpointRecoveryFactory checkpointRecoveryFactory,
 		final Time rpcTimeout,
-		final RestartStrategyFactory restartStrategyFactory,
 		final BlobWriter blobWriter,
 		final JobManagerJobMetricGroup jobManagerJobMetricGroup,
 		final Time slotRequestTimeout,
@@ -202,7 +189,6 @@ public abstract class SchedulerBase implements SchedulerNG {
 		final JobMasterPartitionTracker partitionTracker,
 		final ExecutionVertexVersioner executionVertexVersioner,
 		final ExecutionDeploymentTracker executionDeploymentTracker,
-		final boolean legacyScheduling,
 		long initializationTimestamp) throws Exception {
 
 		this.log = checkNotNull(log);
@@ -216,24 +202,10 @@ public abstract class SchedulerBase implements SchedulerNG {
 		this.checkpointRecoveryFactory = checkNotNull(checkpointRecoveryFactory);
 		this.rpcTimeout = checkNotNull(rpcTimeout);
 
-		final RestartStrategies.RestartStrategyConfiguration restartStrategyConfiguration =
-			jobGraph.getSerializedExecutionConfig()
-				.deserializeValue(userCodeLoader)
-				.getRestartStrategy();
-
-		this.restartStrategy = RestartStrategyResolving.resolve(restartStrategyConfiguration,
-			restartStrategyFactory,
-			jobGraph.isCheckpointingEnabled());
-
-		if (legacyScheduling) {
-			log.info("Using restart strategy {} for {} ({}).", this.restartStrategy, jobGraph.getName(), jobGraph.getJobID());
-		}
-
 		this.blobWriter = checkNotNull(blobWriter);
 		this.jobManagerJobMetricGroup = checkNotNull(jobManagerJobMetricGroup);
 		this.slotRequestTimeout = checkNotNull(slotRequestTimeout);
 		this.executionVertexVersioner = checkNotNull(executionVertexVersioner);
-		this.legacyScheduling = legacyScheduling;
 
 		this.executionGraph = createAndRestoreExecutionGraph(jobManagerJobMetricGroup, checkNotNull(shuffleMaster), checkNotNull(partitionTracker), checkNotNull(executionDeploymentTracker), initializationTimestamp);
 
@@ -284,10 +256,6 @@ public abstract class SchedulerBase implements SchedulerNG {
 			}
 		};
 
-		final FailoverStrategy.Factory failoverStrategy = legacyScheduling ?
-			FailoverStrategyLoader.loadFailoverStrategy(jobMasterConfiguration, log) :
-			new NoOpFailoverStrategy.Factory();
-
 		return ExecutionGraphBuilder.buildGraph(
 			null,
 			jobGraph,
@@ -298,14 +266,12 @@ public abstract class SchedulerBase implements SchedulerNG {
 			userCodeLoader,
 			checkpointRecoveryFactory,
 			rpcTimeout,
-			restartStrategy,
 			currentJobManagerJobMetricGroup,
 			blobWriter,
 			slotRequestTimeout,
 			log,
 			shuffleMaster,
 			partitionTracker,
-			failoverStrategy,
 			executionDeploymentListener,
 			executionStateUpdateListener,
 			initializationTimestamp);
@@ -484,8 +450,7 @@ public abstract class SchedulerBase implements SchedulerNG {
 		return executionGraph.getResultPartitionAvailabilityChecker();
 	}
 
-	protected final void prepareExecutionGraphForNgScheduling() {
-		executionGraph.enableNgScheduling(new UpdateSchedulerNgOnInternalFailuresListener(this, jobGraph.getJobID()));
+	protected final void transitionToRunning() {
 		executionGraph.transitionToRunning();
 	}
 
@@ -549,9 +514,10 @@ public abstract class SchedulerBase implements SchedulerNG {
 	// ------------------------------------------------------------------------
 
 	@Override
-	public void setMainThreadExecutor(final ComponentMainThreadExecutor mainThreadExecutor) {
+	public void initialize(final ComponentMainThreadExecutor mainThreadExecutor) {
 		this.mainThreadExecutor = checkNotNull(mainThreadExecutor);
 		initializeOperatorCoordinators(mainThreadExecutor);
+		executionGraph.setInternalTaskFailuresListener(new UpdateSchedulerNgOnInternalFailuresListener(this, jobGraph.getJobID()));
 		executionGraph.start(mainThreadExecutor);
 	}
 
@@ -719,19 +685,15 @@ public abstract class SchedulerBase implements SchedulerNG {
 	}
 
 	@Override
-	public final void scheduleOrUpdateConsumers(final ResultPartitionID partitionId) {
+	public final void notifyPartitionDataAvailable(final ResultPartitionID partitionId) {
 		mainThreadExecutor.assertRunningInMainThread();
 
-		try {
-			executionGraph.scheduleOrUpdateConsumers(partitionId);
-		} catch (ExecutionGraphException e) {
-			throw new RuntimeException(e);
-		}
+		executionGraph.notifyPartitionDataAvailable(partitionId);
 
-		scheduleOrUpdateConsumersInternal(partitionId.getPartitionId());
+		notifyPartitionDataAvailableInternal(partitionId.getPartitionId());
 	}
 
-	protected void scheduleOrUpdateConsumersInternal(IntermediateResultPartitionID resultPartitionId) {
+	protected void notifyPartitionDataAvailableInternal(IntermediateResultPartitionID resultPartitionId) {
 	}
 
 	@Override
